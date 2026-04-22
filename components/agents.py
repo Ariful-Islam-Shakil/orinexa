@@ -1,9 +1,8 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from google import genai
 from google.genai import types
-
 from components.vector_db import vector_memory
-
+from components.config import Config
 
 class Agent:
     def __init__(
@@ -13,21 +12,9 @@ class Agent:
         backstory: str,
         tools: List[Any],
         client: genai.Client,
-        model: str = "gemini-3-flash-preview",
-        max_memory: int = 8
+        model: str = Config.DEFAULT_MODEL,
+        max_memory: int = 10
     ):
-        """
-        Initialize an intelligent agent.
-
-        Args:
-            name (str): Agent name
-            goal (str): Primary objective of the agent
-            backstory (str): Background context for behavior
-            tools (List[Any]): Available tools
-            client (genai.Client): Gemini client
-            model (str): Model name
-        """
-
         self.name = name
         self.goal = goal
         self.backstory = backstory
@@ -35,34 +22,20 @@ class Agent:
         self.client = client
         self.model = model
         self.max_memory = max_memory
-
-        # 🧠 Internal memory (short-term)
         self.memory: List[Dict[str, str]] = []
 
-    # -----------------------------
-    # Memory Handling
-    # -----------------------------
     def add_to_memory(self, role: str, content: str):
-        """Add message to memory."""
+        """Add message to short-term memory."""
         self.memory.append({"role": role, "content": content})
-
-
+        if len(self.memory) > self.max_memory * 2: # Keep conversation window
+            self.memory = self.memory[-self.max_memory * 2:]
 
     def get_memory_context(self) -> str:
-        """Convert memory into prompt-friendly string."""
-        return "\n".join([f"{m['role']}: {m['content']}" for m in self.memory[-self.max_memory:]])
-    # -----------------------------
-    # Agent Response Parse
-    # -----------------------------
-    def _parse_gemini_response(self, response) -> dict:
-        """
-        Parse Gemini response and extract:
-        - final text
-        - tool calls
-        - tool results
-        - usage info
-        """
+        """Format short-term memory for the prompt."""
+        return "\n".join([f"{m['role']}: {m['content']}" for m in self.memory])
 
+    def _parse_gemini_response(self, response) -> dict:
+        """Extract text, tool calls, and usage from Gemini response."""
         parsed = {
             "text": None,
             "tool_calls": [],
@@ -70,98 +43,62 @@ class Agent:
             "usage": {}
         }
 
-        # -----------------------------
-        # Final response text
-        # -----------------------------
         try:
             parsed["text"] = response.candidates[0].content.parts[0].text
-        except Exception:
-            parsed["text"] = None
+        except (AttributeError, IndexError):
+            parsed["text"] = "I encountered an issue processing the response."
 
-        # -----------------------------
-        # Tool calls + responses
-        # -----------------------------
         try:
-            history = response.automatic_function_calling_history
-
+            history = getattr(response, "automatic_function_calling_history", [])
             for item in history:
                 for part in item.parts:
-
-                    # ✅ Tool call
                     if hasattr(part, "function_call") and part.function_call:
                         fc = part.function_call
                         parsed["tool_calls"].append({
                             "tool_name": getattr(fc, "name", None),
                             "args": getattr(fc, "args", {}),
-                            "id": getattr(fc, "id", None),
                         })
-
-                    # ✅ Tool response
                     if hasattr(part, "function_response") and part.function_response:
                         fr = part.function_response
                         parsed["tool_results"].append({
                             "tool_name": getattr(fr, "name", None),
                             "response": getattr(fr, "response", {}),
                         })
-
         except Exception as e:
-            print("⚠️ Parsing history failed:", e)
+            print(f"⚠️ Error parsing tool history: {e}")
 
-        # -----------------------------
-        # Token usage
-        # -----------------------------
         try:
             usage = response.usage_metadata
             parsed["usage"] = {
-                "prompt_tokens": getattr(usage, "prompt_token_count", None),
-                "completion_tokens": getattr(usage, "candidates_token_count", None),
-                "total_tokens": getattr(usage, "total_token_count", None),
+                "prompt_tokens": usage.prompt_token_count,
+                "completion_tokens": usage.candidates_token_count,
+                "total_tokens": usage.total_token_count,
             }
-        except Exception:
+        except AttributeError:
             pass
 
         return parsed
-    # -----------------------------
-    # Core Agent Execution
-    # -----------------------------
+
     def run(self, query: str) -> str:
-        """
-        Run the agent on a given query.
-
-        Args:
-            query (str): User input
-
-        Returns:
-            str: Agent response
-        """
-
-        # store user input
+        """Execute the agent loop for a given query."""
         self.add_to_memory("User", query)
-
         memory_context = self.get_memory_context()
 
         prompt = f"""
-            You are {self.name}.
+        You are {self.name}.
+        Goal: {self.goal}
+        Backstory: {self.backstory}
 
-            Goal:
-            {self.goal}
+        Conversation History:
+        {memory_context}
 
-            Backstory:
-            {self.backstory}
+        Instructions:
+        - Use tools only when necessary.
+        - Be accurate, logical, and concise.
+        - Use long-term memory via tools if relevant to the query.
+        - Do not hallucinate.
 
-            Conversation History:
-            {memory_context}
-
-            Instructions:
-            - Use tools only when necessary
-            - Don't use unnecessary tool call
-            - Be accurate and logical
-            - Be concise but complete
-            - Use long term memory when realy needed
-            - Do not hallucinate
-
-            Current Task:
-            {query}
+        Current Task: {query}
         """
 
         response = self.client.models.generate_content(
@@ -170,14 +107,16 @@ class Agent:
             config=types.GenerateContentConfig(
                 tools=self.tools,
                 temperature=0.3,
-                max_output_tokens=1024 * 10,
+                max_output_tokens=2048,
             )
         )
 
         output = self._parse_gemini_response(response)
+        
+        # Store in long-term memory
         vector_memory.add(output, query)
-
-        # store response
-        self.add_to_memory("Agent", output)
+        
+        # Update short-term memory with agent's text response
+        self.add_to_memory("Agent", output["text"] if output["text"] else "Command executed.")
 
         return response
